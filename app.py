@@ -33,12 +33,6 @@ except ImportError as e:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-st.set_page_config(
-    page_title="Microstructure Analyzer",
-    page_icon="🔬",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
 
 # Initialize session state
 if 'stage' not in st.session_state:
@@ -68,6 +62,9 @@ def load_image(uploaded_file):
     """Load image from uploaded file"""
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if image is None:
+        st.error("Could not decode image. Please try a different file format.")
+        return None
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     return image_rgb
 
@@ -110,11 +107,12 @@ def segment_grains_watershed(binary_image, original_gray, min_distance=10):
     distance = ndi.distance_transform_edt(binary_image)
     
     # Find local maxima as markers
+    from skimage.morphology import disk
     local_max = morphology.local_maxima(distance, footprint=np.ones((min_distance, min_distance)))
     markers = measure.label(local_max)
     
     # Watershed
-    segmented = segmentation.watershed(-distance, markers, mask=binary_image)
+    segmented = segmentation.watershed(-distance, markers, mask=binary_image.astype(bool))
     
     return segmented
 
@@ -125,7 +123,6 @@ def segment_grains_ananyev(image_gray):
     2. Gaussian blur
     3. Illumination equalization
     4. Adaptive binarization
-    5. Morphological corrections
     """
     # Step 1: Adaptive smoothing
     smoothed = cv2.medianBlur(image_gray, 5)
@@ -134,7 +131,6 @@ def segment_grains_ananyev(image_gray):
     blurred = cv2.GaussianBlur(smoothed, (15, 15), 3)
     
     # Step 3: Illumination equalization (division)
-    # Avoid division by zero
     blurred = np.maximum(blurred, 1)
     equalized = (image_gray.astype(np.float32) / blurred.astype(np.float32)) * 255
     equalized = np.clip(equalized, 0, 255).astype(np.uint8)
@@ -146,9 +142,9 @@ def segment_grains_ananyev(image_gray):
     )
     
     # Step 5: Morphological cleaning
-    kernel = np.ones((3,3), np.uint8)
-    binary = morphology.remove_small_objects(binary.astype(bool), min_size=50)
-    binary = binary.astype(np.uint8)
+    if binary.sum() > 0:
+        binary = morphology.remove_small_objects(binary.astype(bool), min_size=50)
+        binary = binary.astype(np.uint8)
     
     return binary
 
@@ -177,14 +173,10 @@ def extract_grain_properties(segmented_image, calibration_um_per_pixel):
     
     return pd.DataFrame(props_list)
 
-def calculate_porosity(binary_grains, binary_pores=None):
+def calculate_porosity(binary_grains):
     """Calculate porosity percentage"""
-    if binary_pores is None:
-        # Assume pores are dark regions
-        binary_pores = (binary_grains == 0).astype(np.uint8)
-    
-    total_pixels = binary_pores.size
-    pore_pixels = np.sum(binary_pores == 1)
+    total_pixels = binary_grains.size
+    pore_pixels = total_pixels - np.sum(binary_grains)
     porosity = (pore_pixels / total_pixels) * 100
     
     return porosity
@@ -192,7 +184,7 @@ def calculate_porosity(binary_grains, binary_pores=None):
 def create_calibration_figure(image, left_pos, right_pos):
     """Create interactive figure for scale calibration"""
     fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(image)
+    ax.imshow(image, cmap='gray' if len(image.shape) == 2 else None)
     
     h, w = image.shape[:2]
     left_x = int(left_pos * w)
@@ -205,18 +197,26 @@ def create_calibration_figure(image, left_pos, right_pos):
     # Draw line between markers
     ax.plot([left_x, right_x], [h//2, h//2], 'g-', linewidth=2, label='Measured distance')
     
-    ax.set_title('Click and drag sliders below to adjust markers')
+    ax.set_title('Adjust sliders below to align markers with scale bar')
     ax.axis('off')
     ax.legend(loc='upper right')
     
     return fig
 
 # ============================================================================
-# STAGE 1: IMAGE UPLOAD AND PREPROCESSING
+# MAIN APP UI
 # ============================================================================
 
 st.title("🔬 Microstructure Analyzer for Ceramic & Metal Samples")
 st.markdown("---")
+
+# Display Python version warning if needed
+if sys.version_info >= (3, 13):
+    st.warning(f"⚠️ Python {sys.version_info.major}.{sys.version_info.minor} detected. For best performance, use Python 3.11.")
+
+# ============================================================================
+# STAGE 1: IMAGE UPLOAD AND PREPROCESSING
+# ============================================================================
 
 if st.session_state.stage == 1:
     st.header("📤 Stage 1: Image Upload & Preprocessing")
@@ -231,8 +231,9 @@ if st.session_state.stage == 1:
         
         if uploaded_file is not None:
             raw_image = load_image(uploaded_file)
-            st.session_state.raw_image = raw_image
-            st.image(raw_image, caption="Original Image", use_container_width=True)
+            if raw_image is not None:
+                st.session_state.raw_image = raw_image
+                st.image(raw_image, caption="Original Image", use_container_width=True)
     
     with col2:
         if st.session_state.raw_image is not None:
@@ -250,6 +251,7 @@ if st.session_state.stage == 1:
                     )
                     st.session_state.preprocessed_image = processed
                 st.success("Preprocessing complete!")
+                st.rerun()
     
     if st.session_state.preprocessed_image is not None:
         st.image(
@@ -448,11 +450,9 @@ elif st.session_state.stage == 3:
                 if segmentation_method == "Ananyev et al. (classical)":
                     binary = segment_grains_ananyev(st.session_state.preprocessed_image)
                 elif segmentation_method == "Watershed":
-                    # Otsu threshold first
                     thresh = filters.threshold_otsu(st.session_state.preprocessed_image)
                     binary = (st.session_state.preprocessed_image > thresh).astype(np.uint8)
-                    # Clean
-                    binary = morphology.remove_small_objects(binary.astype(bool), min_size=50)
+                    binary = morphology.remove_small_objects(binary.astype(bool), min_size=min_grain_size)
                     binary = binary.astype(np.uint8)
                 else:  # Adaptive thresholding
                     binary = adaptive_binarization(
@@ -470,7 +470,6 @@ elif st.session_state.stage == 3:
                         min_distance=10
                     )
                 else:
-                    # Label connected components
                     segmented = measure.label(binary.astype(bool))
                 
                 # Step 3: Extract properties
@@ -479,26 +478,41 @@ elif st.session_state.stage == 3:
                     st.session_state.calibration_um_per_pixel
                 )
                 
-                # Step 4: Calculate porosity (if applicable)
+                # Step 4: Calculate porosity
                 porosity = calculate_porosity(binary)
                 
                 # Step 5: Statistics
-                stats = {
-                    'total_grains': len(props_df),
-                    'mean_grain_area_um2': props_df['area_um2'].mean(),
-                    'std_grain_area_um2': props_df['area_um2'].std(),
-                    'mean_grain_diameter_um': props_df['eq_diameter_um'].mean(),
-                    'std_grain_diameter_um': props_df['eq_diameter_um'].std(),
-                    'porosity_percent': porosity,
-                    'calibration_um_per_pixel': st.session_state.calibration_um_per_pixel
-                }
-                
-                # Calculate D10, D50, D90
-                diameters = props_df['eq_diameter_um'].sort_values()
-                stats['D10'] = diameters.quantile(0.10)
-                stats['D50'] = diameters.quantile(0.50)
-                stats['D90'] = diameters.quantile(0.90)
-                stats['uniformity_coefficient'] = stats['D60'] if 'D60' in locals() else stats['D90'] / stats['D10']
+                if len(props_df) > 0:
+                    stats = {
+                        'total_grains': len(props_df),
+                        'mean_grain_area_um2': props_df['area_um2'].mean(),
+                        'std_grain_area_um2': props_df['area_um2'].std(),
+                        'mean_grain_diameter_um': props_df['eq_diameter_um'].mean(),
+                        'std_grain_diameter_um': props_df['eq_diameter_um'].std(),
+                        'porosity_percent': porosity,
+                        'calibration_um_per_pixel': st.session_state.calibration_um_per_pixel
+                    }
+                    
+                    # Calculate D10, D50, D90
+                    diameters = props_df['eq_diameter_um'].sort_values()
+                    stats['D10'] = diameters.quantile(0.10)
+                    stats['D50'] = diameters.quantile(0.50)
+                    stats['D90'] = diameters.quantile(0.90)
+                    if stats['D10'] > 0:
+                        stats['uniformity_coefficient'] = stats['D90'] / stats['D10']
+                    else:
+                        stats['uniformity_coefficient'] = 0
+                else:
+                    stats = {
+                        'total_grains': 0,
+                        'mean_grain_area_um2': 0,
+                        'std_grain_area_um2': 0,
+                        'mean_grain_diameter_um': 0,
+                        'std_grain_diameter_um': 0,
+                        'porosity_percent': porosity,
+                        'calibration_um_per_pixel': st.session_state.calibration_um_per_pixel,
+                        'D10': 0, 'D50': 0, 'D90': 0, 'uniformity_coefficient': 0
+                    }
                 
                 st.session_state.segmentation_results = {
                     'binary': binary,
@@ -508,6 +522,7 @@ elif st.session_state.stage == 3:
                 }
                 
                 st.success("Analysis complete!")
+                st.rerun()
         
         # Display results if available
         if st.session_state.segmentation_results is not None:
@@ -529,78 +544,81 @@ elif st.session_state.stage == 3:
                 st.metric("D50", f"{stats['D50']:.2f} µm")
             
             # Grain size histogram
-            st.subheader("📈 Grain Size Distribution")
-            fig, ax = plt.subplots(figsize=(10, 6))
-            ax.hist(results['properties']['eq_diameter_um'], bins=30, edgecolor='black', alpha=0.7)
-            ax.axvline(stats['D10'], color='red', linestyle='--', label=f'D10 = {stats["D10"]:.2f} µm')
-            ax.axvline(stats['D50'], color='green', linestyle='--', label=f'D50 = {stats["D50"]:.2f} µm')
-            ax.axvline(stats['D90'], color='blue', linestyle='--', label=f'D90 = {stats["D90"]:.2f} µm')
-            ax.set_xlabel('Grain Diameter (µm)')
-            ax.set_ylabel('Frequency')
-            ax.set_title('Grain Size Distribution')
-            ax.legend()
-            st.pyplot(fig)
-            plt.close(fig)
+            if len(results['properties']) > 0:
+                st.subheader("📈 Grain Size Distribution")
+                fig, ax = plt.subplots(figsize=(10, 6))
+                ax.hist(results['properties']['eq_diameter_um'], bins=30, edgecolor='black', alpha=0.7)
+                ax.axvline(stats['D10'], color='red', linestyle='--', label=f'D10 = {stats["D10"]:.2f} µm')
+                ax.axvline(stats['D50'], color='green', linestyle='--', label=f'D50 = {stats["D50"]:.2f} µm')
+                ax.axvline(stats['D90'], color='blue', linestyle='--', label=f'D90 = {stats["D90"]:.2f} µm')
+                ax.set_xlabel('Grain Diameter (µm)')
+                ax.set_ylabel('Frequency')
+                ax.set_title('Grain Size Distribution')
+                ax.legend()
+                st.pyplot(fig)
+                plt.close(fig)
             
             # Display images
             st.subheader("🖼️ Segmentation Results")
             col1, col2 = st.columns(2)
             with col1:
-                st.image(results['binary'], caption="Binarized Image", use_container_width=True, clamp=True)
+                st.image(results['binary'] * 255, caption="Binarized Image", use_container_width=True, clamp=True)
             with col2:
                 # Color-coded segmentation
-                colored = measure.label(results['segmented'], background=0)
+                colored = results['segmented'].copy()
                 colored_viz = np.zeros((*colored.shape, 3), dtype=np.uint8)
-                for label_id in np.unique(colored):
+                unique_labels = np.unique(colored)
+                for label_id in unique_labels:
                     if label_id == 0:
                         continue
                     mask = (colored == label_id)
-                    color = np.random.randint(0, 255, 3)
+                    color = np.random.randint(50, 205, 3)
                     colored_viz[mask] = color
                 st.image(colored_viz, caption="Segmented Grains", use_container_width=True)
             
             # Data table
-            with st.expander("📋 Grain Data Table"):
-                st.dataframe(
-                    results['properties'].head(20),
-                    use_container_width=True,
-                    hide_index=True
-                )
-            
-            # Download buttons
-            col1, col2 = st.columns(2)
-            with col1:
-                csv = results['properties'].to_csv(index=False)
-                st.download_button(
-                    "📥 Download CSV",
-                    csv,
-                    "grain_data.csv",
-                    "text/csv"
-                )
-            with col2:
-                # Create report
-                report = f"""
-                MICROSTRUCTURE ANALYSIS REPORT
-                ================================
-                Material Type: {st.session_state.material_type}
-                Calibration: {stats['calibration_um_per_pixel']:.4f} µm/pixel
+            if len(results['properties']) > 0:
+                with st.expander("📋 Grain Data Table"):
+                    st.dataframe(
+                        results['properties'].head(20),
+                        use_container_width=True,
+                        hide_index=True
+                    )
                 
-                GRAIN STATISTICS:
-                - Total grains: {stats['total_grains']}
-                - Mean area: {stats['mean_grain_area_um2']:.2f} µm²
-                - Std area: {stats['std_grain_area_um2']:.2f} µm²
-                - Mean diameter: {stats['mean_grain_diameter_um']:.2f} µm
-                - Std diameter: {stats['std_grain_diameter_um']:.2f} µm
-                - D10: {stats['D10']:.2f} µm
-                - D50: {stats['D50']:.2f} µm
-                - D90: {stats['D90']:.2f} µm
-                - Porosity: {stats['porosity_percent']:.2f} %
-                """
-                st.download_button(
-                    "📄 Download Report",
-                    report,
-                    "analysis_report.txt"
-                )
+                # Download buttons
+                col1, col2 = st.columns(2)
+                with col1:
+                    csv = results['properties'].to_csv(index=False)
+                    st.download_button(
+                        "📥 Download CSV",
+                        csv,
+                        "grain_data.csv",
+                        "text/csv"
+                    )
+                with col2:
+                    report = f"""
+MICROSTRUCTURE ANALYSIS REPORT
+================================
+Material Type: {st.session_state.material_type}
+Calibration: {stats['calibration_um_per_pixel']:.4f} µm/pixel
+
+GRAIN STATISTICS:
+- Total grains: {stats['total_grains']}
+- Mean area: {stats['mean_grain_area_um2']:.2f} µm²
+- Std area: {stats['std_grain_area_um2']:.2f} µm²
+- Mean diameter: {stats['mean_grain_diameter_um']:.2f} µm
+- Std diameter: {stats['std_grain_diameter_um']:.2f} µm
+- D10: {stats['D10']:.2f} µm
+- D50: {stats['D50']:.2f} µm
+- D90: {stats['D90']:.2f} µm
+- Uniformity coefficient: {stats['uniformity_coefficient']:.2f}
+- Porosity: {stats['porosity_percent']:.2f} %
+"""
+                    st.download_button(
+                        "📄 Download Report",
+                        report,
+                        "analysis_report.txt"
+                    )
         
         col1, col2 = st.columns(2)
         with col1:
