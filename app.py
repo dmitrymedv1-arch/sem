@@ -1,13 +1,34 @@
 import streamlit as st
-import cv2
-import numpy as np
-import pandas as pd
-from skimage import filters, morphology, measure, segmentation
-from scipy import ndimage as ndi
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
-from PIL import Image
-import io
+import sys
+import os
+
+# Force reload of page if there are import issues
+st.set_page_config(
+    page_title="Microstructure Analyzer",
+    page_icon="🔬",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Try importing with fallbacks
+try:
+    import cv2
+    import numpy as np
+    import pandas as pd
+    from skimage import filters, morphology, measure, segmentation
+    from scipy import ndimage as ndi
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import io
+except ImportError as e:
+    st.error(f"Import error: {e}")
+    st.info("""
+    Please make sure you have Python 3.11 or 3.12 installed.
+    
+    Create a file called `runtime.txt` with content: `python-3.11`
+    Then redeploy your app.
+    """)
+    st.stop()
 
 # ============================================================================
 # CONFIGURATION
