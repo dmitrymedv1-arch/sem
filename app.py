@@ -1,8 +1,17 @@
 import streamlit as st
 import sys
-import os
+import numpy as np
+import pandas as pd
+from skimage import io, filters, morphology, measure, segmentation, exposure, color, restoration
+from scipy import ndimage as ndi
+import matplotlib.pyplot as plt
+from PIL import Image
+import io as io_lib
 
-# Force reload of page if there are import issues
+# ============================================================================
+# PAGE CONFIGURATION
+# ============================================================================
+
 st.set_page_config(
     page_title="Microstructure Analyzer",
     page_icon="🔬",
@@ -10,31 +19,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Try importing with fallbacks
-try:
-    import cv2
-    import numpy as np
-    import pandas as pd
-    from skimage import filters, morphology, measure, segmentation
-    from scipy import ndimage as ndi
-    import matplotlib.pyplot as plt
-    from PIL import Image
-    import io
-except ImportError as e:
-    st.error(f"Import error: {e}")
-    st.info("""
-    Please make sure you have Python 3.11 or 3.12 installed.
-    
-    Create a file called `runtime.txt` with content: `python-3.11`
-    Then redeploy your app.
-    """)
-    st.stop()
-
 # ============================================================================
-# CONFIGURATION
+# SESSION STATE INITIALIZATION
 # ============================================================================
 
-# Initialize session state
 if 'stage' not in st.session_state:
     st.session_state.stage = 1
 if 'raw_image' not in st.session_state:
@@ -59,87 +47,110 @@ if 'calibration_known_um' not in st.session_state:
 # ============================================================================
 
 def load_image(uploaded_file):
-    """Load image from uploaded file"""
-    file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    image = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-    if image is None:
-        st.error("Could not decode image. Please try a different file format.")
+    """Load image from uploaded file using PIL and convert to numpy array"""
+    try:
+        image = Image.open(uploaded_file)
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        return np.array(image)
+    except Exception as e:
+        st.error(f"Error loading image: {e}")
         return None
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    return image_rgb
 
-def preprocess_image(image, clahe_clip=2.0, clahe_grid=(8,8), denoise=True):
-    """Apply preprocessing: denoising, CLAHE, contrast enhancement"""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+def preprocess_image(image, clahe_clip=0.03, denoise=True):
+    """
+    Apply preprocessing: denoising, CLAHE, contrast enhancement
+    Uses scikit-image instead of OpenCV
+    """
+    # Convert to grayscale (values in 0-1 range)
+    if len(image.shape) == 3:
+        gray = color.rgb2gray(image)
+    else:
+        gray = image.astype(np.float64) / 255.0
     
-    # Denoise if needed
+    # Denoise if needed (bilateral filter equivalent)
     if denoise:
-        gray = cv2.medianBlur(gray, 3)
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
+        gray = restoration.denoise_bilateral(gray, sigma_color=0.05, sigma_spatial=15)
     
     # CLAHE for contrast enhancement
-    clahe = cv2.createCLAHE(clipLimit=clahe_clip, tileGridSize=clahe_grid)
-    enhanced = clahe.apply(gray)
+    enhanced = exposure.equalize_adapthist(gray, clip_limit=clahe_clip)
+    
+    # Convert back to 0-255 uint8 for compatibility
+    enhanced = (enhanced * 255).astype(np.uint8)
     
     return enhanced
 
-def adaptive_binarization(image, method='otsu', block_size=51, c=5):
-    """Adaptive binarization"""
+def adaptive_binarization(image, method='otsu', block_size=51, c=0.05):
+    """Adaptive binarization using scikit-image"""
+    # Normalize image to 0-1 range
+    img_norm = image / 255.0
+    
     if method == 'otsu':
-        thresh = filters.threshold_otsu(image)
-        binary = (image > thresh).astype(np.uint8)
+        thresh = filters.threshold_otsu(img_norm)
+        binary = (img_norm > thresh).astype(np.uint8)
     elif method == 'adaptive_gaussian':
-        binary = cv2.adaptiveThreshold(
-            image, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, block_size, c
-        )
+        thresh = filters.threshold_local(img_norm, block_size, method='gaussian', offset=c)
+        binary = (img_norm > thresh).astype(np.uint8)
     else:  # local mean
-        binary = cv2.adaptiveThreshold(
-            image, 1, cv2.ADAPTIVE_THRESH_MEAN_C,
-            cv2.THRESH_BINARY, block_size, c
-        )
+        thresh = filters.threshold_local(img_norm, block_size, method='mean', offset=c)
+        binary = (img_norm > thresh).astype(np.uint8)
+    
     return binary
 
-def segment_grains_watershed(binary_image, original_gray, min_distance=10):
+def segment_grains_watershed(binary_image, min_distance=10):
     """Watershed segmentation with markers"""
+    # Ensure binary is boolean
+    binary_bool = binary_image.astype(bool)
+    
     # Distance transform
-    distance = ndi.distance_transform_edt(binary_image)
+    distance = ndi.distance_transform_edt(binary_bool)
     
     # Find local maxima as markers
-    from skimage.morphology import disk
-    local_max = morphology.local_maxima(distance, footprint=np.ones((min_distance, min_distance)))
-    markers = measure.label(local_max)
+    from skimage.feature import peak_local_max
     
-    # Watershed
-    segmented = segmentation.watershed(-distance, markers, mask=binary_image.astype(bool))
+    # Adjust min_distance based on image size
+    min_dist = max(min_distance, 5)
+    coordinates = peak_local_max(distance, min_distance=min_dist, exclude_border=False)
+    
+    # Create markers from coordinates
+    markers = np.zeros_like(distance, dtype=int)
+    for i, coord in enumerate(coordinates, start=1):
+        markers[coord[0], coord[1]] = i
+    
+    # Watershed segmentation
+    segmented = segmentation.watershed(-distance, markers, mask=binary_bool)
     
     return segmented
 
 def segment_grains_ananyev(image_gray):
     """
-    Simplified Ananyev et al. algorithm:
-    1. Adaptive smoothing
+    Simplified Ananyev et al. algorithm using scikit-image:
+    1. Adaptive smoothing (median filter)
     2. Gaussian blur
     3. Illumination equalization
     4. Adaptive binarization
     """
-    # Step 1: Adaptive smoothing
-    smoothed = cv2.medianBlur(image_gray, 5)
+    # Normalize to 0-1
+    img = image_gray / 255.0
+    
+    # Step 1: Adaptive smoothing (median filter)
+    from skimage.morphology import disk
+    smoothed = filters.median(img, footprint=disk(2))
     
     # Step 2: Gaussian blur
-    blurred = cv2.GaussianBlur(smoothed, (15, 15), 3)
+    blurred = filters.gaussian(smoothed, sigma=3)
     
     # Step 3: Illumination equalization (division)
-    blurred = np.maximum(blurred, 1)
-    equalized = (image_gray.astype(np.float32) / blurred.astype(np.float32)) * 255
-    equalized = np.clip(equalized, 0, 255).astype(np.uint8)
+    blurred = np.maximum(blurred, 0.01)
+    equalized = img / blurred
+    equalized = np.clip(equalized, 0, 1)
     
     # Step 4: Adaptive binarization
-    binary = cv2.adaptiveThreshold(
-        equalized, 1, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 51, 3
-    )
+    binary = adaptive_binarization((equalized * 255).astype(np.uint8), 
+                                    method='adaptive_gaussian', 
+                                    block_size=51, 
+                                    c=0.03)
     
     # Step 5: Morphological cleaning
     if binary.sum() > 0:
@@ -158,7 +169,11 @@ def extract_grain_properties(segmented_image, calibration_um_per_pixel):
             continue
             
         area_um2 = region.area * (calibration_um_per_pixel ** 2)
-        perimeter_um = region.perimeter * calibration_um_per_pixel
+        
+        # Approximate perimeter (region.perimeter gives approximate value)
+        perimeter_pixels = region.perimeter
+        perimeter_um = perimeter_pixels * calibration_um_per_pixel
+        
         equivalent_diameter_um = np.sqrt(4 * area_um2 / np.pi)
         
         props_list.append({
@@ -168,7 +183,9 @@ def extract_grain_properties(segmented_image, calibration_um_per_pixel):
             'perimeter_um': perimeter_um,
             'eq_diameter_um': equivalent_diameter_um,
             'centroid_x': region.centroid[1],
-            'centroid_y': region.centroid[0]
+            'centroid_y': region.centroid[0],
+            'solidity': region.solidity,
+            'eccentricity': region.eccentricity
         })
     
     return pd.DataFrame(props_list)
@@ -178,13 +195,17 @@ def calculate_porosity(binary_grains):
     total_pixels = binary_grains.size
     pore_pixels = total_pixels - np.sum(binary_grains)
     porosity = (pore_pixels / total_pixels) * 100
-    
     return porosity
 
 def create_calibration_figure(image, left_pos, right_pos):
     """Create interactive figure for scale calibration"""
     fig, ax = plt.subplots(figsize=(10, 8))
-    ax.imshow(image, cmap='gray' if len(image.shape) == 2 else None)
+    
+    # Display image (handle both RGB and grayscale)
+    if len(image.shape) == 3:
+        ax.imshow(image)
+    else:
+        ax.imshow(image, cmap='gray')
     
     h, w = image.shape[:2]
     left_x = int(left_pos * w)
@@ -209,10 +230,6 @@ def create_calibration_figure(image, left_pos, right_pos):
 
 st.title("🔬 Microstructure Analyzer for Ceramic & Metal Samples")
 st.markdown("---")
-
-# Display Python version warning if needed
-if sys.version_info >= (3, 13):
-    st.warning(f"⚠️ Python {sys.version_info.major}.{sys.version_info.minor} detected. For best performance, use Python 3.11.")
 
 # ============================================================================
 # STAGE 1: IMAGE UPLOAD AND PREPROCESSING
@@ -239,8 +256,10 @@ if st.session_state.stage == 1:
         if st.session_state.raw_image is not None:
             st.subheader("Preprocessing Settings")
             
-            clahe_clip = st.slider("CLAHE clip limit", 1.0, 5.0, 2.0, 0.5)
-            denoise = st.checkbox("Apply denoising", value=True)
+            clahe_clip = st.slider("CLAHE clip limit", 0.01, 0.1, 0.03, 0.005, 
+                                   help="Higher values increase local contrast")
+            denoise = st.checkbox("Apply denoising", value=True,
+                                 help="Reduces noise while preserving edges")
             
             if st.button("🔄 Apply Preprocessing", type="primary"):
                 with st.spinner("Processing image..."):
@@ -256,7 +275,7 @@ if st.session_state.stage == 1:
     if st.session_state.preprocessed_image is not None:
         st.image(
             st.session_state.preprocessed_image,
-            caption="Preprocessed Image",
+            caption="Preprocessed Image (grayscale)",
             use_container_width=True,
             clamp=True
         )
@@ -425,7 +444,8 @@ elif st.session_state.stage == 3:
                 min_value=10,
                 max_value=500,
                 value=50,
-                step=10
+                step=10,
+                help="Smaller objects will be ignored"
             )
             
             run_analysis = st.button(
@@ -450,8 +470,11 @@ elif st.session_state.stage == 3:
                 if segmentation_method == "Ananyev et al. (classical)":
                     binary = segment_grains_ananyev(st.session_state.preprocessed_image)
                 elif segmentation_method == "Watershed":
-                    thresh = filters.threshold_otsu(st.session_state.preprocessed_image)
-                    binary = (st.session_state.preprocessed_image > thresh).astype(np.uint8)
+                    # Otsu threshold first
+                    img_norm = st.session_state.preprocessed_image / 255.0
+                    thresh = filters.threshold_otsu(img_norm)
+                    binary = (img_norm > thresh).astype(np.uint8)
+                    # Remove small objects
                     binary = morphology.remove_small_objects(binary.astype(bool), min_size=min_grain_size)
                     binary = binary.astype(np.uint8)
                 else:  # Adaptive thresholding
@@ -459,17 +482,14 @@ elif st.session_state.stage == 3:
                         st.session_state.preprocessed_image,
                         method='adaptive_gaussian',
                         block_size=51,
-                        c=5
+                        c=0.05
                     )
                 
                 # Step 2: Segmentation
                 if segmentation_method == "Watershed":
-                    segmented = segment_grains_watershed(
-                        binary, 
-                        st.session_state.preprocessed_image,
-                        min_distance=10
-                    )
+                    segmented = segment_grains_watershed(binary, min_distance=10)
                 else:
+                    # Label connected components
                     segmented = measure.label(binary.astype(bool))
                 
                 # Step 3: Extract properties
@@ -568,12 +588,15 @@ elif st.session_state.stage == 3:
                 colored = results['segmented'].copy()
                 colored_viz = np.zeros((*colored.shape, 3), dtype=np.uint8)
                 unique_labels = np.unique(colored)
-                for label_id in unique_labels:
+                # Use fixed color map for better visualization
+                from matplotlib.colors import hsv_to_rgb
+                for i, label_id in enumerate(unique_labels):
                     if label_id == 0:
                         continue
-                    mask = (colored == label_id)
-                    color = np.random.randint(50, 205, 3)
-                    colored_viz[mask] = color
+                    # Generate distinct colors
+                    hue = (label_id * 0.618033988749895) % 1.0  # Golden ratio for spacing
+                    color = np.array(hsv_to_rgb([hue, 0.8, 0.9])) * 255
+                    colored_viz[colored == label_id] = color.astype(np.uint8)
                 st.image(colored_viz, caption="Segmented Grains", use_container_width=True)
             
             # Data table
@@ -613,6 +636,12 @@ GRAIN STATISTICS:
 - D90: {stats['D90']:.2f} µm
 - Uniformity coefficient: {stats['uniformity_coefficient']:.2f}
 - Porosity: {stats['porosity_percent']:.2f} %
+
+ANALYSIS PARAMETERS:
+- Segmentation method: {segmentation_method}
+- Minimum grain size: {min_grain_size} pixels
+
+Report generated by Microstructure Analyzer
 """
                     st.download_button(
                         "📄 Download Report",
@@ -635,6 +664,6 @@ GRAIN STATISTICS:
 # ============================================================================
 st.markdown("---")
 st.markdown(
-    "<center><small>Microstructure Analyzer v1.0 | Built with Streamlit, OpenCV, scikit-image</small></center>",
+    "<center><small>Microstructure Analyzer v1.0 | Built with Streamlit & scikit-image | Compatible with Python 3.14</small></center>",
     unsafe_allow_html=True
 )
